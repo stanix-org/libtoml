@@ -345,7 +345,7 @@ static int toml_parser_peek_char(toml_parser_t *parser) {
 }
 
 static void toml_parser_no_memory(toml_parser_t *parser) {
-	static const char *no_memory_available = "No memory available";
+	static const char *no_memory_available = "no memory available";
 	if (parser->error) {
 		parser->error->allocated = 0;
 		parser->error->string = (char*)no_memory_available;
@@ -354,7 +354,7 @@ static void toml_parser_no_memory(toml_parser_t *parser) {
 
 #ifdef TOML_NO_FLOATS
 static void toml_parser_no_float(toml_parser_t *parser) {
-	static const char *no_float_available = "Compiled with float disabled";
+	static const char *no_float_available = "compiled with float disabled";
 	if (parser->error) {
 		parser->error->allocated = 0;
 		parser->error->string = (char*)no_float_available;
@@ -778,16 +778,24 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 			c = toml_parser_get_char(parser);
 			break;
 		default:
-			toml_parser_unget_char(parser, c);
+			toml_parser_unget_char(parser, next);
 			break;
 		}
 	}
 
-	// TODO
 	long integer = 0;
 	for (;;) {
 		if (!toml_is_ndigit(base, c)) {
-			toml_parser_unexpected(parser, c);
+			// try to throw more usefull errors than just
+			// "unexpected"
+			if (toml_is_hex_digit(c)) {
+				toml_parser_set_error(parser, "syntax error : invalid digit '%c' for base %d", c, base);
+			} else if (c == '_') {
+underscore_error:
+				toml_parser_set_error(parser, "syntax error : a '_' must be surrounded by digits");
+			} else {
+				toml_parser_unexpected(parser, c);
+			}
 			return NULL;
 		}
 
@@ -795,20 +803,40 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 		integer += toml_digit_to_number(c);
 
 		c = toml_parser_get_char(parser);
+
+		// NOTE: the spec does not accept prefixed 0 for base 10
+		if (base == 10 && integer == 0) {
+			if (toml_is_ndigit(base, c)) {
+				// throw a more usefull error than just
+				// "unexpected"
+				toml_parser_set_error(parser, "syntax error : cannot have a '%c' digit after a 0 for base 10", c);
+				return NULL;
+			}
+			break;
+		}
+
 		if (c == '_') {
 			// optional underscore
 			// NOTE : we must have a valid digit after it
 			c = toml_parser_get_char(parser);
+			if (!toml_is_hex_digit(c)) goto underscore_error;
 		} else if (!toml_is_ndigit(base, c)) {
 			break;
 		}
 	}
 
+
+	if (base == 10) {
+		// TODO : check for e or . for floats
+		if (c == '.') {
+			TOML_ASSERT("TODO : float");
+		}
+	}
+
+	// TODO : check for dates
+
 	toml_parser_unget_char(parser, c);
-
-	// TODO : check for e or . for floats
-
-	return TOML_VALUE(toml_integer_new(integer));
+	return TOML_VALUE(toml_integer_new(sign == '-' ? -integer : integer));
 }
 
 static toml_bool_t *toml_parser_bool(toml_parser_t *parser) {
