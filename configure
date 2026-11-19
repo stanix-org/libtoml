@@ -1,0 +1,16 @@
+#!/bin/sh
+
+. "$(dirname "$0")/tconf.sh"
+
+: ${STATIC:="yes"}
+: ${SHARED:="yes"}
+OPTIONS="STATIC SHARED"
+
+tconf_init "$@"
+
+tconf_search_cc "$HOST"
+tconf_find_os
+
+tconf_gen_makefiles "$SRCDIR/Makefile.in" "$SRCDIR/demo/Makefile.in"
+
+tconf_fini

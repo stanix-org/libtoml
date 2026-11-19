@@ -1,0 +1,8 @@
+TMAKE_DIR ?= $(TOP)/make
+include $(TMAKE_DIR)/tmake-init.mk
+
+PROG = toml-demo
+SRCS = $(SRCDIR)/demo.c
+CFLAGS += -I$(TOP)/include
+LDFLAGS = -L$(BUILDDIR)/..  -ltoml
+include $(TMAKE_DIR)/tmake-prog.mk 
