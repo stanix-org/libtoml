@@ -76,10 +76,17 @@ union toml_value {
 	toml_bool_t bool_;
 };
 
+
+// TODO : drop this??
 typedef struct toml_iter {
 	toml_table_t *table;
 	size_t index;
 } toml_iter_t;
+
+typedef struct toml_error {
+	int allocated;
+	char *string;
+} toml_error_t;
 
 toml_value_t *toml_value_new(toml_type_t type);
 void toml_value_free(toml_value_t *value);
@@ -117,13 +124,13 @@ toml_bool_t *toml_bool_new(int value);
 toml_value_t *toml_iter_init(toml_iter_t *iter, toml_table_t *table);
 toml_value_t *toml_iter_next(toml_iter_t *iter);
 
-void toml_free_error(char *error);
-toml_table_t *toml_parse(int (*get_char)(void *data), void *data, const char *filename, char **error);
-toml_table_t *toml_parse_string(const char *string, const char *filename, char **error);
+void toml_error_free(toml_error_t *error);
+toml_table_t *toml_parse(int (*get_char)(void *data), void *data, const char *filename, toml_error_t *error);
+toml_table_t *toml_parse_string(const char *string, const char *filename, toml_error_t *error);
 
 #ifdef __STDC_HOSTED__
-toml_table_t *toml_parse_stream(FILE *stream, const char *filename, char **error);
-toml_table_t *toml_parse_file(const char *filename, char **error);
+toml_table_t *toml_parse_stream(FILE *stream, const char *filename, toml_error_t *error);
+toml_table_t *toml_parse_file(const char *filename, toml_error_t *error);
 #endif
 
 #endif

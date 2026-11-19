@@ -4,7 +4,7 @@
 typedef struct toml_parser toml_parser_t;
 
 struct toml_parser {
-	char **error;
+	toml_error_t *error;
 	int unget;
 	int colno;
 	int lineno;
@@ -21,6 +21,7 @@ static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table);
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <float.h>
 #include <errno.h>
 #define TOML_MALLOC(size)       malloc(size)
 #define TOML_FREE(ptr)          free(ptr)
@@ -48,8 +49,6 @@ static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table);
 	if (!(cond)) TOML_UNREACHABLE \ \
 	} while (0)
 #endif
-
-static const char *toml_no_memory_available = "No memory available";
 
 #ifndef TOML_MEMSET
 static void *toml_memset_helper(void *ptr, int value, size_t size) {
@@ -259,8 +258,27 @@ void toml_string_reset(toml_string_t *string) {
 	string->length = 0;
 }
 
-toml_integer_t *toml_integer_new(long value);
-toml_float_t *toml_float_new(float value);
+toml_integer_t *toml_integer_new(long integer_value) {
+	toml_value_t *value = toml_value_new(TOML_TYPE_INTEGER);
+	if (!value) return NULL;
+
+	toml_integer_t *integer = &value->integer;
+	integer->value = integer_value;
+	return integer;
+}
+
+toml_float_t *toml_float_new(float float_value) {
+#ifdef TOML_NO_FLOATS
+	return NULL;
+#else
+	toml_value_t *value = toml_value_new(TOML_TYPE_FLOAT);
+	if (!value) return NULL;
+
+	toml_float_t *float_ = &value->float_;
+	float_->value = float_value;
+	return float_;
+#endif
+}
 toml_date_t *toml_date_new(long date);
 
 toml_bool_t *toml_bool_new(int bool_value) {
@@ -283,14 +301,13 @@ toml_value_t *toml_iter_next(toml_iter_t *iter) {
 	return iter->table->values[iter->index++].value;
 }
 
-void toml_free_error(char *error) {
-	// toml_no_memory_available is a special case
-	// used when indeed no memory is available
-	if (error == toml_no_memory_available) return;
-	TOML_FREE(error);
+void toml_error_free(toml_error_t *error) {
+	if (error->allocated) {
+		TOML_FREE(error->string);
+	}
 }
 
-static void toml_parser_init(toml_parser_t *parser, int (*get_char)(void *private), void *private, const char *filename, char **error) {
+static void toml_parser_init(toml_parser_t *parser, int (*get_char)(void *private), void *private, const char *filename, toml_error_t *error) {
 	parser->error    = error;
 	parser->unget    = TOML_NOTHING;
 	parser->colno    = 0;
@@ -328,10 +345,22 @@ static int toml_parser_peek_char(toml_parser_t *parser) {
 }
 
 static void toml_parser_no_memory(toml_parser_t *parser) {
+	static const char *no_memory_available = "No memory available";
 	if (parser->error) {
-		*parser->error = (char*)toml_no_memory_available;
+		parser->error->allocated = 0;
+		parser->error->string = (char*)no_memory_available;
 	}
 }
+
+#ifdef TOML_NO_FLOATS
+static void toml_parser_no_float(toml_parser_t *parser) {
+	static const char *no_float_available = "Compiled with float disabled";
+	if (parser->error) {
+		parser->error->allocated = 0;
+		parser->error->string = (char*)no_float_available;
+	}
+}
+#endif
 
 static void toml_parser_set_error(toml_parser_t *parser, const char *fmt, ...) {
 	if (!parser->error) return;
@@ -341,8 +370,9 @@ static void toml_parser_set_error(toml_parser_t *parser, const char *fmt, ...) {
 	TOML_VSNPRINTF(buf, sizeof(buf), fmt, args);
 	va_end(args);
 
-	*parser->error = TOML_STRDUP(buf);
-	if (!*parser->error) {
+	parser->error->allocated = 1;
+	parser->error->string    = TOML_STRDUP(buf);
+	if (!parser->error->string) {
 		toml_parser_no_memory(parser);
 	}
 }
@@ -373,7 +403,22 @@ static int toml_is_hex_digit(int c) {
 	return toml_is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-static int toml_hex_digit_to_number(int c) {
+static int toml_is_ndigit(int base, int c) {
+	switch (base) {
+	case 2:
+		return c == '0' || c == '1';
+	case 8:
+		return c >= '0' && c <= '7';
+	case 10:
+		return toml_is_digit(c);
+	case 16:
+		return toml_is_hex_digit(c);
+	default:
+		return 0;
+	}
+}
+
+static int toml_digit_to_number(int c) {
 	TOML_ASSERT(toml_is_hex_digit(c));
 	if (toml_is_digit(c)) {
 		return c - '0';
@@ -573,7 +618,7 @@ static int toml_parser_hexcode(toml_parser_t *parser, int count) {
 			return TOML_EOF;
 		}
 		value *= 16;
-		value += toml_hex_digit_to_number(c);
+		value += toml_digit_to_number(c);
 	}
 	return value;
 }
@@ -684,8 +729,86 @@ static toml_string_t *toml_parser_string(toml_parser_t *parser) {
 
 static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 	(void)parser;
-	TOML_ASSERT("TODO");
-	return NULL;
+	
+	int c = toml_parser_get_char(parser);
+	int sign = '\0';
+	if (c == '+' || c == '-') {
+		sign = c;
+		c = toml_parser_get_char(parser);
+	}
+
+	switch (c) {
+	case 'i':
+		// inf
+		if (toml_parser_expect(parser, 'n') < 0) return NULL;
+		if (toml_parser_expect(parser, 'f') < 0) return NULL;
+#ifdef TOML_NO_FLOATS
+		toml_parser_no_float(parser);
+		return NULL;
+#else
+		return TOML_VALUE(toml_float_new(sign == '-' ? -INFINITY : INFINITY));
+#endif
+	case 'n':
+		// nan
+		if (toml_parser_expect(parser, 'a') < 0) return NULL;
+		if (toml_parser_expect(parser, 'n') < 0) return NULL;
+#ifdef TOML_NO_FLOATS
+		toml_parser_no_float(parser);
+		return NULL;
+#else
+		return TOML_VALUE(toml_float_new(sign == '-' ? -NAN : NAN));
+#endif
+	}
+
+	int base = 10;
+	if (c == '0' && !sign) {
+		// is this a prefix ?
+		int next = toml_parser_get_char(parser);
+		switch (next) {
+		case 'x':
+			base = 16;
+			c = toml_parser_get_char(parser);
+			break;
+		case 'o':
+			base = 8;
+			c = toml_parser_get_char(parser);
+			break;
+		case 'b':
+			base = 2;
+			c = toml_parser_get_char(parser);
+			break;
+		default:
+			toml_parser_unget_char(parser, c);
+			break;
+		}
+	}
+
+	// TODO
+	long integer = 0;
+	for (;;) {
+		if (!toml_is_ndigit(base, c)) {
+			toml_parser_unexpected(parser, c);
+			return NULL;
+		}
+
+		integer *= base;
+		integer += toml_digit_to_number(c);
+
+		c = toml_parser_get_char(parser);
+		if (c == '_') {
+			// optional underscore
+			// NOTE : we must have a valid digit after it
+			c = toml_parser_get_char(parser);
+		} else if (!toml_is_ndigit(base, c)) {
+			break;
+		}
+	}
+
+	toml_parser_unget_char(parser, c);
+
+	// TODO : check for e or . for floats
+
+	return TOML_VALUE(toml_integer_new(integer));
 }
 
 static toml_bool_t *toml_parser_bool(toml_parser_t *parser) {
@@ -720,10 +843,10 @@ static toml_value_t *toml_parser_value(toml_parser_t *parser) {
 		return TOML_VALUE(toml_parser_string(parser));
 	case '+': case '-':
 	case 'i': case 'n': 
-	case 0:
-	case 1: case 2: case 3:
-	case 4: case 5: case 6:
-	case 7: case 8: case 9:
+	case '0':
+	case '1': case '2': case '3':
+	case '4': case '5': case '6':
+	case '7': case '8': case '9':
 		return TOML_VALUE(toml_parser_integer_float_or_date(parser));
 	case 't':
 	case 'f':
@@ -862,7 +985,7 @@ error:
 	return NULL;
 }
 
-toml_table_t *toml_parse(int (*get_char)(void *data), void *data, const char *filename, char **error) {
+toml_table_t *toml_parse(int (*get_char)(void *data), void *data, const char *filename, toml_error_t *error) {
 	toml_parser_t parser;
 	toml_parser_init(&parser, get_char, data, filename, error);
 	return toml_parser_entry(&parser);
@@ -879,7 +1002,7 @@ static int toml_parse_string_helper(void *data) {
 	}
 }
 
-toml_table_t *toml_parse_string(const char *string, const char *filename, char **error) {
+toml_table_t *toml_parse_string(const char *string, const char *filename, toml_error_t *error) {
 	if (!string) return NULL;
 	return toml_parse(toml_parse_string_helper, &string, filename, error);
 }
@@ -893,14 +1016,17 @@ static int toml_parse_stream_helper(void *data) {
 	return c;
 }
 
-toml_table_t *toml_parse_stream(FILE *stream, const char *filename, char **error) {
+toml_table_t *toml_parse_stream(FILE *stream, const char *filename, toml_error_t *error) {
 	return toml_parse(toml_parse_stream_helper, stream, filename, error);
 }
 
-toml_table_t *toml_parse_file(const char *filename, char **error) {
+toml_table_t *toml_parse_file(const char *filename, toml_error_t *error) {
 	FILE *file = fopen(filename, "r");
 	if (!file) {
-		if (error) *error = strerror(errno);
+		if (error) {
+			error->string = strerror(errno);
+			error->allocated = 1;
+		}
 		return NULL;
 	}
 
