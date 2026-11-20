@@ -85,8 +85,17 @@ typedef struct toml_iter {
 
 typedef struct toml_error {
 	int allocated;
+	int lineno;
+	int colno;
+	int type;
 	char *string;
+	const char *filename;
 } toml_error_t;
+
+#define TOML_ERROR_MEMORY  1
+#define TOML_ERROR_SYNTAX  2
+#define TOML_ERROR_UNICODE 3
+#define TOML_ERROR_FEATURE 4
 
 toml_value_t *toml_value_new(toml_type_t type);
 void toml_value_free(toml_value_t *value);
@@ -109,6 +118,7 @@ void toml_string_free(toml_string_t *string);
 int toml_string_append_buf(toml_string_t *string, const char *buf, size_t size);
 int toml_string_append_str(toml_string_t *string, const char *str);
 int toml_string_append_char(toml_string_t *string, char c);
+int toml_string_append_codepoint(toml_string_t *string, int c);
 void toml_string_reset(toml_string_t *string);
 
 toml_integer_t *toml_integer_new(long value);
@@ -125,7 +135,9 @@ toml_value_t *toml_iter_init(toml_iter_t *iter, toml_table_t *table);
 toml_value_t *toml_iter_next(toml_iter_t *iter);
 
 void toml_error_free(toml_error_t *error);
-toml_table_t *toml_parse(int (*get_char)(void *data), void *data, const char *filename, toml_error_t *error);
+void toml_error_to_str(toml_error_t *error, char *buf, size_t size);
+
+toml_table_t *toml_parse(int (*get_byte)(void *data), void *data, const char *filename, toml_error_t *error);
 toml_table_t *toml_parse_string(const char *string, const char *filename, toml_error_t *error);
 
 #ifdef __STDC_HOSTED__

@@ -32,7 +32,7 @@ void print_value(toml_value_t *value, size_t depth) {
 		PRINT("string: '%s'\n", value->string.value);
 		break;
 	case TOML_TYPE_INTEGER:
-		PRINT("integer: %d\n", value->integer.value);
+		PRINT("integer: %ld\n", value->integer.value);
 		break;
 	case TOML_TYPE_BOOL:
 		switch (value->bool_.value) {
@@ -55,7 +55,9 @@ int main(int argc, char **argv) {
 		toml_error_t error;
 		toml_table_t *table = toml_parse_file(argv[i], &error);
 		if (!table) {
-			fprintf(stderr, "%s\n", error.string);
+			char buf[1024];
+			toml_error_to_str(&error, buf, sizeof(buf));
+			fprintf(stderr, "%s\n", buf);
 			return 1;
 		}
 

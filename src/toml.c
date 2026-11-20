@@ -10,7 +10,7 @@ struct toml_parser {
 	int lineno;
 	const char *filename;
 	void *private;
-	int (*get_char)(void *private);
+	int (*get_byte)(void *private);
 };
 
 static toml_value_t *toml_parser_value(toml_parser_t *parser);
@@ -94,6 +94,14 @@ static char *toml_strdup_helper(const char *str) {
 }
 #define TOML_STRDUP(str) toml_strdup_helper(str)
 #endif
+
+static int toml_snprintf(char *buf, size_t size, const char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	int ret = TOML_VSNPRINTF(buf, size, fmt, args);
+	va_end(args);
+	return ret;
+}
 
 toml_value_t *toml_value_new(toml_type_t type) {
 	toml_value_t *value = TOML_MALLOC(sizeof(toml_value_t));
@@ -253,6 +261,43 @@ int toml_string_append_char(toml_string_t *string, char c) {
 	return toml_string_append_buf(string, &c, sizeof(c));
 }
 
+int toml_string_append_codepoint(toml_string_t *string, int c) {
+	// we don't use wchar functions
+	// because the spec says utf8 must be used
+	// and we have no guarantee wchar funcs use utf8
+	int len;
+	char data[4] = {0};
+	if (c < 0) {
+		return -1;
+	} else if (c <= 0x7f) {
+		data[0] = c;
+		len = 1;
+	} else if (c <= 0x7ff) {
+		data[0] = 0xc0 | ((c >> 6) & 0x1f);
+		data[1] = 0x80 | (c & 0x3f);
+		len = 2;
+	} else if (c <= 0xffff) {
+		if (c >= 0xd800 && c <= 0xdfff) {
+			// these are used for utf16 surrogate
+			return -1;
+		}
+		data[0] = 0xe0 | ((c >> 12) & 0x0f);
+		data[1] = 0x80 | ((c >> 6) & 0x3f);
+		data[2] = 0x80 | (c & 0x3f);
+		len = 3;
+	} else if (c <= 0x10ffff) {
+		data[0] = 0xf0 | ((c >> 18) & 0x07);
+		data[1] = 0x80 | ((c >> 12) & 0x3f);
+		data[2] = 0x80 | ((c >> 6) & 0x3f);
+		data[3] = 0x80 | (c & 0x3f);
+		len = 4;
+	} else {
+		return -1;
+	}
+
+	return toml_string_append_buf(string, data, len * sizeof(char));
+}
+
 void toml_string_reset(toml_string_t *string) {
 	string->value[0] = '\0';
 	string->length = 0;
@@ -307,14 +352,65 @@ void toml_error_free(toml_error_t *error) {
 	}
 }
 
-static void toml_parser_init(toml_parser_t *parser, int (*get_char)(void *private), void *private, const char *filename, toml_error_t *error) {
+void toml_error_to_str(toml_error_t *error, char *buf, size_t size) {
+	const char *filename = error->filename ? error->filename : "";
+	switch (error->type) {
+	case TOML_ERROR_SYNTAX:
+		toml_snprintf(buf, size, "%s:%d : syntax error : %s", filename, error->lineno, error->string);
+		break;
+	case TOML_ERROR_UNICODE:
+		toml_snprintf(buf, size, "%s:%d : unicode error : %s", filename, error->lineno, error->string);
+		break;
+	default:
+		toml_snprintf(buf, size, "%s", error->string);
+		break;
+	}
+}
+
+static void toml_parser_init(toml_parser_t *parser, int (*get_byte)(void *private), void *private, const char *filename, toml_error_t *error) {
 	parser->error    = error;
 	parser->unget    = TOML_NOTHING;
 	parser->colno    = 0;
 	parser->lineno   = 0;
 	parser->filename = filename ? filename : "";
 	parser->private  = private;
-	parser->get_char = get_char;
+	parser->get_byte = get_byte;
+}
+
+static void toml_parser_set_error(toml_parser_t *parser, int type, int allocated, const char *message) {
+	if (!parser->error) return;
+	parser->error->type      = type;
+	parser->error->filename  = parser->filename;
+	parser->error->lineno    = parser->lineno;
+	parser->error->colno     = parser->colno;
+	parser->error->allocated = allocated;
+	parser->error->string    = (char*)message;
+}
+
+static void toml_parser_no_memory(toml_parser_t *parser) {
+	toml_parser_set_error(parser, TOML_ERROR_MEMORY, TOML_FALSE, "no memory available");
+}
+
+#ifdef TOML_NO_FLOATS
+static void toml_parser_no_float(toml_parser_t *parser) {
+	toml_parser_set_error(parser, TOML_ERROR_FEATURE, TOML_FALSE, "compiled with float disabled");
+}
+#endif
+
+static void toml_parser_error(toml_parser_t *parser, int type, const char *fmt, ...) {
+	if (!parser->error) return;
+	char buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	TOML_VSNPRINTF(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	char *str = TOML_STRDUP(buf);
+	if (str) {
+		toml_parser_set_error(parser, type, TOML_TRUE, str);
+	} else {
+		toml_parser_no_memory(parser);
+	}
 }
 
 static int toml_parser_get_char(toml_parser_t *parser) {
@@ -324,13 +420,77 @@ static int toml_parser_get_char(toml_parser_t *parser) {
 		return c;
 	}
 
-	int c = parser->get_char(parser->private);
-	if (c == '\n') {
+	unsigned char data[4] = {0};
+	int c = parser->get_byte(parser->private);
+	if (c == TOML_EOF) return c;
+	data[0] = c;
+
+	int len ;
+	if (data[0] <= 0x7f) {
+		len = 1;
+	} else if (data[0] <= 0xc1) {
+invalid:
+		toml_parser_error(parser, TOML_ERROR_UNICODE, "invalid UTF-8 character");
+		return TOML_EOF;
+	} else if (data[0] <= 0xdf) {
+		len = 2;
+	} else if (data[0] <= 0xef) {
+		len = 3;
+	} else if (data[0] <= 0xf7) {
+		len = 4;
+	} else {
+		goto invalid;
+	}
+
+	// we've already read one byte
+	for (int i = 1; i < len; i++) {
+		int current = parser->get_byte(parser->private);
+		if (current == TOML_EOF) goto invalid;
+		data[i] = current;
+	}
+
+	int decoded = 0;
+	switch (len) {
+	case 1:
+		decoded = data[0];
+		break;
+	case 2:
+		if ((data[1] & 0xc0) != 0x80) goto invalid;
+		decoded = ((data[0] & 0x1f) << 6);
+		decoded |= (data[1] & 0x3f);
+		if (decoded <= 0x7f) goto invalid;
+		break;
+	case 3:
+		if ((data[1] & 0xc0) != 0x80) goto invalid;
+		if ((data[2] & 0xc0) != 0x80) goto invalid;
+		decoded = ((data[0] & 0x0f) << 12);
+		decoded |= (data[1] & 0x3f) << 6;
+		decoded |= (data[2] & 0x3f);
+		if (decoded <= 0x7ff) goto invalid;
+		if (decoded >= 0xd800 && decoded <= 0xdfff) {
+			// these are used for utf16 surrogate
+			goto invalid;
+		}
+		break;
+	case 4:
+		if ((data[1] & 0xc0) != 0x80) goto invalid;
+		if ((data[2] & 0xc0) != 0x80) goto invalid;
+		if ((data[3] & 0xc0) != 0x80) goto invalid;
+		decoded = ((data[0] & 0x07) << 18);
+		decoded |= (data[1] & 0x3f) << 12;
+		decoded |= (data[2] & 0x3f) << 6;
+		decoded |= (data[3] & 0x3f);
+		if (decoded <= 0xffff) goto invalid;
+		if (decoded > 0x10ffff) goto invalid;
+		break;
+	}
+
+	if (decoded == '\n') {
 		// turn into
 		parser->lineno++;
 		parser->colno  = 0;
 	}
-	return c;
+	return decoded;
 }
 
 static void toml_parser_unget_char(toml_parser_t *parser, int unget) {
@@ -344,41 +504,32 @@ static int toml_parser_peek_char(toml_parser_t *parser) {
 	return c;
 }
 
-static void toml_parser_no_memory(toml_parser_t *parser) {
-	static const char *no_memory_available = "no memory available";
-	if (parser->error) {
-		parser->error->allocated = 0;
-		parser->error->string = (char*)no_memory_available;
+static const char *toml_char_name(char *buf, size_t size, int c) {
+	switch (c) {
+	case '\t':
+		return "<tab>";
+	case '\r':
+		return "<carriage-return>";
+	case '\n':
+		return "<newline>";
+	case TOML_EOF:
+		return "<eof>";
 	}
-}
-
-#ifdef TOML_NO_FLOATS
-static void toml_parser_no_float(toml_parser_t *parser) {
-	static const char *no_float_available = "compiled with float disabled";
-	if (parser->error) {
-		parser->error->allocated = 0;
-		parser->error->string = (char*)no_float_available;
+#ifdef TOML_NO_UNICODE
+	if (toml_is_ascii(c)) {
+		toml_snprintf(buf, size, "%c", c);
+	} else {
+		toml_snprintf(buf, size, "\\U%08x", c);
 	}
-}
+#else
+	toml_snprintf(buf, size, "%lc", c);
 #endif
-
-static void toml_parser_set_error(toml_parser_t *parser, const char *fmt, ...) {
-	if (!parser->error) return;
-	char buf[1024];
-	va_list args;
-	va_start(args, fmt);
-	TOML_VSNPRINTF(buf, sizeof(buf), fmt, args);
-	va_end(args);
-
-	parser->error->allocated = 1;
-	parser->error->string    = TOML_STRDUP(buf);
-	if (!parser->error->string) {
-		toml_parser_no_memory(parser);
-	}
+	return buf;
 }
 
 static void toml_parser_unexpected(toml_parser_t *parser, int c) {
-	toml_parser_set_error(parser, "%s:%d : syntax error : unexpected '%c'", parser->filename, parser->lineno, c);
+	char buf[16];
+	toml_parser_error(parser, TOML_ERROR_SYNTAX, "unexpected '%s'", parser->filename, parser->lineno, toml_char_name(buf, sizeof(buf), c));
 }
 
 static int toml_parser_expect(toml_parser_t *parser, int expected) {
@@ -386,7 +537,11 @@ static int toml_parser_expect(toml_parser_t *parser, int expected) {
 	if (c == expected) {
 		return 0;
 	} else {
-		toml_parser_set_error(parser, "%s:%d : syntax error : unexpected '%c', expected '%c'", parser->filename, parser->lineno, c, expected);
+		char expected_buf[16];
+		char got_buf[16];
+		const char *expected_name = toml_char_name(expected_buf, sizeof(expected_buf), expected);
+		const char *got_name      = toml_char_name(got_buf, sizeof(got_buf), c);
+		toml_parser_error(parser, TOML_ERROR_SYNTAX, "unexpected '%s', expected '%s'", parser->filename, parser->lineno, got_name, expected_name);
 		return -1;
 	}
 }
@@ -454,7 +609,6 @@ static int toml_is_key_value(int c) {
 }
 
 static int toml_is_ascii(int c) {
-	// TODO : fix
 	return c >= 0 && c <= 0x7f;
 }
 
@@ -609,18 +763,25 @@ error:
 	return NULL;
 }
 
-static int toml_parser_hexcode(toml_parser_t *parser, int count) {
-	int value = 0;
+static int toml_parser_codepoint(toml_parser_t *parser, int count) {
+	unsigned int codepoint = 0;
 	for (int i = 0; i < count; i++) {
 		int c = toml_parser_get_char(parser);
 		if (!toml_is_hex_digit(c)) {
-			toml_parser_unexpected(parser, c);
+			char buf[16];
+			toml_parser_error(parser, TOML_ERROR_SYNTAX, "invalid digit '%s' for unicode codepoint", toml_char_name(buf, sizeof(buf), c));
 			return TOML_EOF;
 		}
-		value *= 16;
-		value += toml_digit_to_number(c);
+		codepoint *= 16;
+		codepoint += toml_digit_to_number(c);
 	}
-	return value;
+
+	// 0xd800 to 0xdfff are used for utf16 surrogate
+	if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+		toml_parser_error(parser, TOML_ERROR_UNICODE, "invalid unicode codepoint \\U%08x", codepoint);
+		return TOML_EOF;
+	}
+	return codepoint;
 }
 
 static int toml_parser_escaped(toml_parser_t *parser) {
@@ -645,11 +806,11 @@ static int toml_parser_escaped(toml_parser_t *parser) {
 	case 't':
 		return '\t';
 	case 'x':
-		return toml_parser_hexcode(parser, 2);
+		return toml_parser_codepoint(parser, 2);
 	case 'u':
-		return toml_parser_hexcode(parser, 4);
+		return toml_parser_codepoint(parser, 4);
 	case 'U':
-		return toml_parser_hexcode(parser, 8);
+		return toml_parser_codepoint(parser, 8);
 	default:
 		toml_parser_unexpected(parser, c);
 		return TOML_EOF;
@@ -678,10 +839,12 @@ static toml_string_t *toml_parser_basic_string(toml_parser_t *parser) {
 
 	while (toml_is_basic_char(toml_parser_peek_char(parser))) {
 		int c = toml_parser_basic_char(parser);
-		toml_string_append_char(string, c);
+		if (c == TOML_EOF) goto error;
+		toml_string_append_codepoint(string, c);
 	}
 
 	if (toml_parser_expect(parser, '"') < 0) {
+error:
 		toml_value_free(TOML_VALUE(string));
 		return NULL;
 	}
@@ -700,7 +863,7 @@ static toml_string_t *toml_parser_litteral_string(toml_parser_t *parser) {
 
 	int	c = toml_parser_get_char(parser);
 	while (toml_is_litteral_char(c)) {
-		toml_string_append_char(string, c);
+		toml_string_append_codepoint(string, c);
 		c = toml_parser_get_char(parser);
 	}
 	toml_parser_unget_char(parser, c);
@@ -789,10 +952,10 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 			// try to throw more usefull errors than just
 			// "unexpected"
 			if (toml_is_hex_digit(c)) {
-				toml_parser_set_error(parser, "syntax error : invalid digit '%c' for base %d", c, base);
+				toml_parser_error(parser, TOML_ERROR_SYNTAX, "invalid digit '%c' for base %d", c, base);
 			} else if (c == '_') {
 underscore_error:
-				toml_parser_set_error(parser, "syntax error : a '_' must be surrounded by digits");
+				toml_parser_error(parser, TOML_ERROR_SYNTAX, "a '_' must be surrounded by digits");
 			} else {
 				toml_parser_unexpected(parser, c);
 			}
@@ -809,7 +972,7 @@ underscore_error:
 			if (toml_is_ndigit(base, c)) {
 				// throw a more usefull error than just
 				// "unexpected"
-				toml_parser_set_error(parser, "syntax error : cannot have a '%c' digit after a 0 for base 10", c);
+				toml_parser_error(parser, TOML_ERROR_SYNTAX, "cannot have a '%c' digit after a 0 for base 10", c);
 				return NULL;
 			}
 			break;
@@ -1013,9 +1176,9 @@ error:
 	return NULL;
 }
 
-toml_table_t *toml_parse(int (*get_char)(void *data), void *data, const char *filename, toml_error_t *error) {
+toml_table_t *toml_parse(int (*get_byte)(void *data), void *data, const char *filename, toml_error_t *error) {
 	toml_parser_t parser;
-	toml_parser_init(&parser, get_char, data, filename, error);
+	toml_parser_init(&parser, get_byte, data, filename, error);
 	return toml_parser_entry(&parser);
 }
 
@@ -1038,7 +1201,6 @@ toml_table_t *toml_parse_string(const char *string, const char *filename, toml_e
 #ifdef __STDC_HOSTED__
 
 static int toml_parse_stream_helper(void *data) {
-	// TODO : fgetwc ?
 	int c = fgetc(data);
 	if (c == EOF) c = TOML_EOF;
 	return c;
