@@ -431,7 +431,7 @@ static int toml_parser_get_char(toml_parser_t *parser) {
 	} else if (data[0] <= 0xc1) {
 invalid:
 		toml_parser_error(parser, TOML_ERROR_UNICODE, "invalid UTF-8 character");
-		return TOML_EOF;
+		return TOML_ERROR;
 	} else if (data[0] <= 0xdf) {
 		len = 2;
 	} else if (data[0] <= 0xef) {
@@ -529,19 +529,21 @@ static const char *toml_char_name(char *buf, size_t size, int c) {
 
 static void toml_parser_unexpected(toml_parser_t *parser, int c) {
 	char buf[16];
-	toml_parser_error(parser, TOML_ERROR_SYNTAX, "unexpected '%s'", parser->filename, parser->lineno, toml_char_name(buf, sizeof(buf), c));
+	toml_parser_error(parser, TOML_ERROR_SYNTAX, "unexpected '%s'", toml_char_name(buf, sizeof(buf), c));
 }
 
 static int toml_parser_expect(toml_parser_t *parser, int expected) {
 	int c = toml_parser_get_char(parser);
 	if (c == expected) {
 		return 0;
+	} else if (c == TOML_ERROR) {
+		return -1;
 	} else {
 		char expected_buf[16];
 		char got_buf[16];
 		const char *expected_name = toml_char_name(expected_buf, sizeof(expected_buf), expected);
 		const char *got_name      = toml_char_name(got_buf, sizeof(got_buf), c);
-		toml_parser_error(parser, TOML_ERROR_SYNTAX, "unexpected '%s', expected '%s'", parser->filename, parser->lineno, got_name, expected_name);
+		toml_parser_error(parser, TOML_ERROR_SYNTAX, "unexpected '%s', expected '%s'", got_name, expected_name);
 		return -1;
 	}
 }
@@ -619,7 +621,7 @@ static int toml_is_eof(int c) {
 static int toml_is_basic_unescaped(int c) {
 	if (toml_is_ascii(c)) {
 		return toml_is_space(c) || (c > ' ' && c != 0x7f && c != '"' && c != '\\');
-	} else if (c == TOML_EOF) {
+	} else if (c == TOML_EOF || c == TOML_ERROR) {
 		return 0;
 	} else {
 		return 1;
@@ -633,7 +635,7 @@ static int toml_is_basic_char(int c) {
 static int toml_is_litteral_char(int c) {
 	if (toml_is_ascii(c)) {
 		return toml_is_space(c) || (c > ' ' && c != 0x7f && c != '\'');
-	} else if (c == TOML_EOF) {
+	} else if (c == TOML_EOF || c == TOML_ERROR) {
 		return 0;
 	} else {
 		return 1;
@@ -663,6 +665,8 @@ static int toml_parser_newline(toml_parser_t *parser) {
 		return 0;
 	case '\r':
 		return toml_parser_expect(parser, '\n');
+	case TOML_ERROR:
+		return -1;
 	default:
 		toml_parser_unexpected(parser, c);
 		return -1;
@@ -682,6 +686,8 @@ static int toml_parser_skip_spaces_comments_newlines(toml_parser_t *parser) {
 		case '\r':
 			if (toml_parser_newline(parser) < 0) return -1;
 			break;
+		case TOML_ERROR:
+			return -1;
 		default:
 			return 0;
 		}
@@ -767,10 +773,11 @@ static int toml_parser_codepoint(toml_parser_t *parser, int count) {
 	unsigned int codepoint = 0;
 	for (int i = 0; i < count; i++) {
 		int c = toml_parser_get_char(parser);
+		if (c == TOML_ERROR) return TOML_ERROR;
 		if (!toml_is_hex_digit(c)) {
 			char buf[16];
 			toml_parser_error(parser, TOML_ERROR_SYNTAX, "invalid digit '%s' for unicode codepoint", toml_char_name(buf, sizeof(buf), c));
-			return TOML_EOF;
+			return TOML_ERROR;
 		}
 		codepoint *= 16;
 		codepoint += toml_digit_to_number(c);
@@ -779,7 +786,7 @@ static int toml_parser_codepoint(toml_parser_t *parser, int count) {
 	// 0xd800 to 0xdfff are used for utf16 surrogate
 	if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
 		toml_parser_error(parser, TOML_ERROR_UNICODE, "invalid unicode codepoint \\U%08x", codepoint);
-		return TOML_EOF;
+		return TOML_ERROR;
 	}
 	return codepoint;
 }
@@ -811,9 +818,11 @@ static int toml_parser_escaped(toml_parser_t *parser) {
 		return toml_parser_codepoint(parser, 4);
 	case 'U':
 		return toml_parser_codepoint(parser, 8);
+	case TOML_ERROR:
+		return TOML_ERROR;
 	default:
 		toml_parser_unexpected(parser, c);
-		return TOML_EOF;
+		return TOML_ERROR;
 	}
 }
 
@@ -839,7 +848,7 @@ static toml_string_t *toml_parser_basic_string(toml_parser_t *parser) {
 
 	while (toml_is_basic_char(toml_parser_peek_char(parser))) {
 		int c = toml_parser_basic_char(parser);
-		if (c == TOML_EOF) goto error;
+		if (c == TOML_ERROR) goto error;
 		toml_string_append_codepoint(string, c);
 	}
 
@@ -884,6 +893,8 @@ static toml_string_t *toml_parser_string(toml_parser_t *parser) {
 		return toml_parser_basic_string(parser);
 	case '\'':
 		return toml_parser_litteral_string(parser);
+	case TOML_ERROR:
+		return NULL;
 	default:
 		toml_parser_unexpected(parser, c);
 		return NULL;
@@ -956,7 +967,7 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 			} else if (c == '_') {
 underscore_error:
 				toml_parser_error(parser, TOML_ERROR_SYNTAX, "a '_' must be surrounded by digits");
-			} else {
+			} else if (c != TOML_ERROR) {
 				toml_parser_unexpected(parser, c);
 			}
 			return NULL;
@@ -982,6 +993,7 @@ underscore_error:
 			// optional underscore
 			// NOTE : we must have a valid digit after it
 			c = toml_parser_get_char(parser);
+			if (c == TOML_ERROR) return NULL;
 			if (!toml_is_hex_digit(c)) goto underscore_error;
 		} else if (!toml_is_ndigit(base, c)) {
 			break;
@@ -1016,6 +1028,8 @@ static toml_bool_t *toml_parser_bool(toml_parser_t *parser) {
 		if (toml_parser_expect(parser, 's') < 0) return NULL;
 		if (toml_parser_expect(parser, 'e') < 0) return NULL;
 		return toml_bool_new(TOML_FALSE);
+	case TOML_ERROR:
+		return NULL;
 	default:
 		toml_parser_unexpected(parser, c);
 		return NULL;
@@ -1042,6 +1056,8 @@ static toml_value_t *toml_parser_value(toml_parser_t *parser) {
 	case 't':
 	case 'f':
 		return TOML_VALUE(toml_parser_bool(parser));
+	case TOML_ERROR:
+		return NULL;
 	default:
 		toml_parser_unexpected(parser, c);
 		return NULL;
@@ -1071,6 +1087,8 @@ static toml_string_t *toml_parser_simple_key(toml_parser_t *parser) {
 		// quoted litteral string key
 		toml_parser_unget_char(parser, c);
 		return toml_parser_litteral_string(parser);
+	} else if (c == TOML_ERROR) {
+		return NULL;
 	} else {
 		toml_parser_unexpected(parser, c);
 		return NULL;
@@ -1137,6 +1155,8 @@ static int toml_parser_expression(toml_parser_t *parser, toml_table_t *table) {
 			toml_parser_skip_line(parser);
 		}
 		return 0;
+	} else if (c == TOML_ERROR) {
+		return -1;
 	} else {
 		// nothing is actually a valid expression
 		return 0;
@@ -1164,6 +1184,8 @@ static toml_table_t *toml_parser_entry(toml_parser_t *parser) {
 			}
 		} else if (c == '\n') {
 			continue;
+		} else if (c == TOML_ERROR) {
+			goto error;
 		} else {
 			toml_parser_unexpected(parser, c);
 			goto error;
@@ -1184,7 +1206,7 @@ toml_table_t *toml_parse(int (*get_byte)(void *data), void *data, const char *fi
 
 static int toml_parse_string_helper(void *data) {
 	const char **ptr = data;
-	if (!**ptr) {
+	if (**ptr) {
 		int c = **ptr;
 		(*ptr)++;
 		return c;

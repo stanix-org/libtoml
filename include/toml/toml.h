@@ -130,6 +130,7 @@ toml_bool_t *toml_bool_new(int value);
 
 #define TOML_EOF     -1
 #define TOML_NOTHING -2
+#define TOML_ERROR   -3
 
 toml_value_t *toml_iter_init(toml_iter_t *iter, toml_table_t *table);
 toml_value_t *toml_iter_next(toml_iter_t *iter);
