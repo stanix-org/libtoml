@@ -36,10 +36,11 @@ static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table);
 #define TOML_MEMCPY(dest, src, size)  memcpy(dest, src, size)
 #define TOML_STRDUP(str)        strdup(str)
 #define TOML_STRLEN(str)        strlen(str)
+#define TOML_STRCMP(a, b)       strcmp(a, b)
 #define TOML_VSNPRINTF(...)     vsnprintf(__VA_ARGS__)
 #define TOML_ASSERT(cond)       assert(cond)
 #elif !defined(TOML_MALLOC) || !defined(TOML_FREE) || !defined(TOML_REALLOC)
-#error "TOML_MALLOC, TOML_FREE and optionnaly TOML_REALLOC, TOML_MEMSET, TOML_MEMCPY, TOML_STRLEN, TOML_STRDUP TOML_VSNPRINTF and TOML_ASSERT must be defined in freestanding mode"
+#error "TOML_MALLOC, TOML_FREE and optionnaly TOML_REALLOC, TOML_MEMSET, TOML_MEMCPY, TOML_STRLEN, TOML_STRDUP TOML_STRCMP, TOML_VSNPRINTF and TOML_ASSERT must be defined in freestanding mode"
 #endif
 
 #ifndef TOML_UNREACHABLE
@@ -99,6 +100,18 @@ static char *toml_strdup_helper(const char *str) {
 	return TOML_MEMCPY(new_str, str, len + 1);
 }
 #define TOML_STRDUP(str) toml_strdup_helper(str)
+#endif
+
+#ifndef TOML_STRCMP
+static int toml_strcmp_helper(const char *a, const char *b) {
+	while (*a || *b) {
+		if (*a != *b) return *a - *b;
+		a++;
+		b++;
+	}
+	return 0;
+}
+#define TOML_STRCMP(a, b) toml_strcmp_helper(a, b)
 #endif
 
 static int toml_snprintf(char *buf, size_t size, const char *fmt, ...) {
@@ -171,7 +184,14 @@ int toml_table_set(toml_table_t *table, const char *name, toml_value_t *value) {
 	return 0;
 }
 
-toml_value_t *toml_table_get(toml_table_t *table, const char *name);
+toml_value_t *toml_table_get(toml_table_t *table, const char *name) {
+	for (size_t i = 0; i < table->count; i++) {
+		if (!TOML_STRCMP(table->values[i].key, name)) {
+			return table->values[i].value;
+		}
+	}
+	return NULL;
+}
 
 toml_array_t *toml_array_new(void) {
 	toml_value_t *value = toml_value_new(TOML_TYPE_ARRAY);
