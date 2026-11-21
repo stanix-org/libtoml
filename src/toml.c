@@ -1317,16 +1317,20 @@ static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table) {
 
 	toml_parser_skip_spaces(parser);
 	if (toml_parser_expect(parser, '=') < 0) goto free_key;
+
+	// check if already defined
+	if (toml_table_get(table, key->value)) {
+		toml_parser_error(parser, TOML_ERROR_SYNTAX, "'%s' already defined", key->value);
+		goto free_key;
+	}
+
 	toml_parser_skip_spaces(parser);
 
 	toml_value_t *value = toml_parser_value(parser);
 	if (!value) goto free_key;
 
-	// TODO : check if already defined
-
 	if (toml_table_set(table, key->value, value) < 0) {
 		toml_parser_no_memory(parser);
-free_value:
 		toml_value_free(value);
 free_key:
 		toml_string_free(key);
