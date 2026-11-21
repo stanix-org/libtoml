@@ -2,6 +2,10 @@ TMAKE_DIR = $(TOP)/make
 include $(TMAKE_DIR)/tmake-init.mk
 
 PACKAGE = toml
+
+INCSDIR := $(INCSDIR)/toml
+INCS = $(SRCDIR)/include/toml/toml.h
+
 SRCS = $(SRCDIR)/src/toml.c
 CFLAGS += -I $(SRCDIR)/include
 include $(TMAKE_DIR)/tmake-lib.mk 

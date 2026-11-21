@@ -1283,7 +1283,7 @@ static int toml_parser_key(toml_parser_t *parser, toml_table_t *table, toml_tabl
 		toml_value_t *sub_value = toml_table_get(table, key->value);
 		if (sub_value) {
 			if (sub_value->type != TOML_TYPE_TABLE) {
-				toml_parser_error(parser, TOML_ERROR_SYNTAX, "'%s' previously defined as not a table", key->value);
+				toml_parser_error(parser, TOML_ERROR_SYNTAX, "'%s' previously not defined as a table", key->value);
 				goto error;
 			}
 			table = &sub_value->table;
@@ -1346,7 +1346,15 @@ free_key:
 
 static toml_table_t *toml_parser_table(toml_parser_t *parser, toml_table_t *root) {
 	if (toml_parser_expect(parser, '[') < 0) return NULL;
-	// TODO : array tables
+
+	int is_array_table = TOML_FALSE;
+	int c = toml_parser_get_char(parser);
+	if (c == '[') {
+		is_array_table = TOML_TRUE;
+	} else {
+		toml_parser_unget_char(parser, c);
+	}
+
 
 	toml_parser_skip_spaces(parser);
 
@@ -1354,22 +1362,55 @@ static toml_table_t *toml_parser_table(toml_parser_t *parser, toml_table_t *root
 	toml_string_t *key;
 	if (toml_parser_key(parser, root, &parent, &key) < 0) return NULL;
 
-	if (toml_parser_verify_not_defined(parser, parent, key) < 0) {
-free_key:
-		toml_string_free(key);
-		return NULL;
-	}
+	toml_table_t *table = NULL;
+	if (is_array_table) {
+		// array table
+		toml_value_t *array_value = toml_table_get(parent, key->value);
+		toml_array_t *array;
+		if (array_value) {
+			if (array_value->type != TOML_TYPE_ARRAY || !array_value->array.is_array_of_table) {
+				toml_parser_error(parser, TOML_ERROR_SYNTAX, "'%s' previously not defined as an array of table", key->value);
+				goto free_key;
+			}
+			array = &array_value->array;
+		} else {
+			array = toml_array_new();
+			array->is_array_of_table = TOML_TRUE;
+			if (!array) goto no_memory;
+			if (toml_table_set(parent, key->value, TOML_VALUE(array)) < 0) {
+				toml_array_free(array);
+				goto no_memory;
+			}
+		}
 
-	toml_table_t *table = toml_table_new();
-	if (!table) {
-		toml_parser_no_memory(parser);
-		goto free_key;
-	}
+		table = toml_table_new();
+		if (!table) goto no_memory;
+		if (toml_array_append(array, TOML_VALUE(table)) < 0) goto free_table;
+	} else {
+		// standard table
+		// TODO : support appending to last element of array of table
+		if (toml_parser_verify_not_defined(parser, parent, key) < 0) goto free_key;
+
+		table = toml_table_new();
+		if (!table) goto no_memory;
 	
-	if (toml_table_set(parent, key->value, TOML_VALUE(table)) < 0) goto free_key;
+		if (toml_table_set(parent, key->value, TOML_VALUE(table)) < 0) {
+free_table:
+			toml_table_free(table);
+no_memory:
+			toml_parser_no_memory(parser);
+free_key:
+			toml_string_free(key);
+			return NULL;
+		}
+	}
 	toml_string_free(key);
 
 	toml_parser_skip_spaces(parser);
+
+	if (is_array_table) {
+		if (toml_parser_expect(parser, ']') < 0) return NULL;
+	}
 	if (toml_parser_expect(parser, ']') < 0) return NULL;
 
 	return table;

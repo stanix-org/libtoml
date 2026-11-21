@@ -33,6 +33,7 @@ typedef struct toml_array {
 	toml_type_t type;
 	size_t capacity;
 	size_t count;
+	int is_array_of_table;
 	toml_value_t **values;
 } toml_array_t;
 
