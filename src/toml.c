@@ -1310,6 +1310,14 @@ error:
 	return 0;
 }
 
+static int toml_parser_verify_not_defined(toml_parser_t *parser, toml_table_t *table, toml_string_t *key) {
+	if (toml_table_get(table, key->value)) {
+		toml_parser_error(parser, TOML_ERROR_SYNTAX, "'%s' already defined", key->value);
+		return -1;
+	}
+	return 0;
+}
+
 static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table) {
 	toml_string_t *key;
 	
@@ -1318,11 +1326,7 @@ static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table) {
 	toml_parser_skip_spaces(parser);
 	if (toml_parser_expect(parser, '=') < 0) goto free_key;
 
-	// check if already defined
-	if (toml_table_get(table, key->value)) {
-		toml_parser_error(parser, TOML_ERROR_SYNTAX, "'%s' already defined", key->value);
-		goto free_key;
-	}
+	if (toml_parser_verify_not_defined(parser, table, key) < 0) goto free_key;
 
 	toml_parser_skip_spaces(parser);
 
@@ -1340,17 +1344,48 @@ free_key:
 	return 0;
 }
 
-static int toml_parser_expression(toml_parser_t *parser, toml_table_t *table) {
+static toml_table_t *toml_parser_table(toml_parser_t *parser, toml_table_t *root) {
+	if (toml_parser_expect(parser, '[') < 0) return NULL;
+	// TODO : array tables
+
+	toml_parser_skip_spaces(parser);
+
+	toml_table_t *parent;
+	toml_string_t *key;
+	if (toml_parser_key(parser, root, &parent, &key) < 0) return NULL;
+
+	if (toml_parser_verify_not_defined(parser, parent, key) < 0) {
+free_key:
+		toml_string_free(key);
+		return NULL;
+	}
+
+	toml_table_t *table = toml_table_new();
+	if (!table) {
+		toml_parser_no_memory(parser);
+		goto free_key;
+	}
+	
+	if (toml_table_set(parent, key->value, TOML_VALUE(table)) < 0) goto free_key;
+	toml_string_free(key);
+
+	toml_parser_skip_spaces(parser);
+	if (toml_parser_expect(parser, ']') < 0) return NULL;
+
+	return table;
+}
+
+static toml_table_t *toml_parser_expression(toml_parser_t *parser, toml_table_t *root, toml_table_t *table) {
 	toml_parser_skip_spaces(parser);
 
 	int c = toml_parser_peek_char(parser);
 	if (toml_is_comment(c)) {
 		// comment
 		toml_parser_skip_line(parser);
-		return 0;
+		return table;
 	} else if (toml_is_key_value(c)) {
 		// key value pair
-		if (toml_parser_key_value(parser, table) < 0) return -1;
+		if (toml_parser_key_value(parser, table) < 0) return NULL;
 
 		// we might have a comment
 		toml_parser_skip_spaces(parser);
@@ -1358,10 +1393,11 @@ static int toml_parser_expression(toml_parser_t *parser, toml_table_t *table) {
 		if (toml_is_comment(c)) {
 			toml_parser_skip_line(parser);
 		}
-		return 0;
+		return table;
 	} else if (c == '[') {
 		// table
-		TOML_ASSERT("TODO : tables");
+		table = toml_parser_table(parser, root);
+		if (!table) return NULL;
 		
 		// we might have a comment
 		toml_parser_skip_spaces(parser);
@@ -1369,24 +1405,26 @@ static int toml_parser_expression(toml_parser_t *parser, toml_table_t *table) {
 		if (toml_is_comment(c)) {
 			toml_parser_skip_line(parser);
 		}
-		return 0;
+		return table;
 	} else if (c == TOML_ERROR) {
-		return -1;
+		return NULL;
 	} else {
 		// nothing is actually a valid expression
-		return 0;
+		return table;
 	}
 }
 
 static toml_table_t *toml_parser_entry(toml_parser_t *parser) {
-	toml_table_t *table = toml_table_new();
-	if (!table) {
+	toml_table_t *root = toml_table_new();
+	if (!root) {
 		toml_parser_no_memory(parser);
 		return NULL;
 	}
 
+	// start at the root table
+	toml_table_t *table = root;
 	for (;;) {
-		if (toml_parser_expression(parser, table) < 0) {
+		if (!(table = toml_parser_expression(parser, root, table))) {
 			goto error;
 		}
 
@@ -1407,9 +1445,9 @@ static toml_table_t *toml_parser_entry(toml_parser_t *parser) {
 		}
 	}
 
-	return table;
+	return root;
 error:
-	toml_value_free(TOML_VALUE(table));
+	toml_table_free(root);
 	return NULL;
 }
 
