@@ -951,6 +951,7 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 		if (!toml_is_ndigit(base, c)) {
 			// try to throw more usefull errors than just
 			// "unexpected"
+digit_error:
 			if (toml_is_hex_digit(c)) {
 				toml_parser_error(parser, TOML_ERROR_SYNTAX, "invalid digit '%c' for base %d", c, base);
 			} else if (c == '_') {
@@ -991,9 +992,85 @@ underscore_error:
 
 
 	if (base == 10) {
-		// TODO : check for e or . for floats
+		int have_float = TOML_FALSE;
+
+		long frac = 1;
 		if (c == '.') {
-			TOML_ASSERT("TODO : float");
+			have_float = TOML_TRUE;
+			c = toml_parser_get_char(parser);
+			for (;;) {
+				if (!toml_is_digit(c)) goto digit_error;
+
+				integer *= 10;
+				frac *= 10;
+				integer += toml_digit_to_number(c);
+
+				c = toml_parser_get_char(parser);
+
+				if (c == '_') {
+					// optional underscore
+					// NOTE : we must have a valid digit after it
+					c = toml_parser_get_char(parser);
+					if (c == TOML_ERROR) return NULL;
+					if (!toml_is_hex_digit(c)) goto underscore_error;
+				} else if (!toml_is_digit(c)) {
+					break;
+				}
+			}
+		}
+	
+
+		long pow = 0;
+		if (c == 'e') {
+			have_float = TOML_TRUE;
+			int pow_sign = '+';
+			c = toml_parser_get_char(parser);
+			if (c == '-' || c == '+') {
+				pow_sign = c;
+				c = toml_parser_get_char(parser);
+			}
+
+			long pow_value = 0;
+			for (;;) {
+				if (!toml_is_digit(c)) goto digit_error;
+
+				pow_value *= 10;
+				pow_value += toml_digit_to_number(c);
+
+				c = toml_parser_get_char(parser);
+
+				if (c == '_') {
+					// optional underscore
+					// NOTE : we must have a valid digit after it
+					c = toml_parser_get_char(parser);
+					if (c == TOML_ERROR) return NULL;
+					if (!toml_is_hex_digit(c)) goto underscore_error;
+				} else if (!toml_is_digit(c)) {
+					break;
+				}
+			}
+
+			pow = pow_sign == '-' ? -pow_value : pow_value;
+		}
+
+		if (have_float) {
+			toml_parser_unget_char(parser, c);
+#ifdef TOML_NO_FLOATS
+			toml_parser_no_float(parser);
+			return NULL;
+#else
+			float f = (float)(sign == '-' ? -integer : integer) / frac;
+			if (pow > 0) {
+				for (long i = 0; i < pow; i++) {
+					f *= 10;
+				}
+			} else if (pow < 0) {
+				for (long i = 0; i > pow; i--) {
+					f /= 10;
+				}
+			}
+			return TOML_VALUE(toml_float_new(f));
+#endif
 		}
 	}
 

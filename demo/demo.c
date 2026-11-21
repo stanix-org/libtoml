@@ -34,6 +34,9 @@ void print_value(toml_value_t *value, size_t depth) {
 	case TOML_TYPE_INTEGER:
 		PRINT("integer: %ld\n", value->integer.value);
 		break;
+	case TOML_TYPE_FLOAT:
+		PRINT("float: %g\n", value->float_.value);
+		break;
 	case TOML_TYPE_BOOL:
 		switch (value->bool_.value) {
 		case TOML_TRUE:
