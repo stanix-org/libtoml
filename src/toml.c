@@ -335,17 +335,6 @@ toml_bool_t *toml_bool_new(int bool_value) {
 	return bool_;
 }
 
-toml_value_t *toml_iter_init(toml_iter_t *iter, toml_table_t *table) {
-	iter->table = table;
-	iter->index = 0;
-	return table->count > 0 ? table->values[0].value : NULL;
-}
-
-toml_value_t *toml_iter_next(toml_iter_t *iter) {
-	if (iter->index >= iter->table->count) return NULL;
-	return iter->table->values[iter->index++].value;
-}
-
 void toml_error_free(toml_error_t *error) {
 	if (error->allocated) {
 		TOML_FREE(error->string);

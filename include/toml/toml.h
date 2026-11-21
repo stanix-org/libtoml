@@ -77,12 +77,6 @@ union toml_value {
 };
 
 
-// TODO : drop this??
-typedef struct toml_iter {
-	toml_table_t *table;
-	size_t index;
-} toml_iter_t;
-
 typedef struct toml_error {
 	int allocated;
 	int lineno;
@@ -131,9 +125,6 @@ toml_bool_t *toml_bool_new(int value);
 #define TOML_EOF     -1
 #define TOML_NOTHING -2
 #define TOML_ERROR   -3
-
-toml_value_t *toml_iter_init(toml_iter_t *iter, toml_table_t *table);
-toml_value_t *toml_iter_next(toml_iter_t *iter);
 
 void toml_error_free(toml_error_t *error);
 void toml_error_to_str(toml_error_t *error, char *buf, size_t size);
