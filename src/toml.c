@@ -1,5 +1,6 @@
 #include <toml/toml.h>
 #include <stdarg.h>
+#include <limits.h>
 
 typedef struct toml_parser toml_parser_t;
 
@@ -349,6 +350,9 @@ void toml_error_to_str(toml_error_t *error, char *buf, size_t size) {
 		break;
 	case TOML_ERROR_UNICODE:
 		toml_snprintf(buf, size, "%s:%d : unicode error : %s", filename, error->lineno, error->string);
+		break;
+	case TOML_ERROR_LIMIT:
+		toml_snprintf(buf, size, "%s:%d : limit error : %s", filename, error->lineno, error->string);
 		break;
 	default:
 		toml_snprintf(buf, size, "%s", error->string);
@@ -890,6 +894,82 @@ static toml_string_t *toml_parser_string(toml_parser_t *parser) {
 	}
 }
 
+static void toml_parser_underscore_error(toml_parser_t *parser) {
+	toml_parser_error(parser, TOML_ERROR_SYNTAX, "a '_' must be surrounded by digits");
+}
+
+static void toml_parser_digit_error(toml_parser_t *parser, int base, int c) {
+	// try to throw more usefull errors than just
+	// "unexpected"
+	if (toml_is_hex_digit(c)) {
+		toml_parser_error(parser, TOML_ERROR_SYNTAX, "invalid digit '%c' for base %d", c, base);
+	} else if (c == '_') {
+		toml_parser_underscore_error(parser);
+	} else if (c != TOML_ERROR) {
+		toml_parser_unexpected(parser, c);
+	}
+}
+
+static void toml_parser_integer_overflow_error(toml_parser_t *parser) {
+	toml_parser_error(parser, TOML_ERROR_LIMIT, "integer overflow (limit is %ld/%ld)", LONG_MAX, -LONG_MAX);
+}
+
+static long toml_parser_unsigned_integer(toml_parser_t *parser, int base, int allow_zero_prefix, int c) {
+	long integer = 0;
+	TOML_ASSERT(base != 0);
+
+	for (;;) {
+		if (!toml_is_ndigit(base, c)) {
+			toml_parser_digit_error(parser, base, c);
+			return LONG_MIN;
+		}
+
+		if (LONG_MAX / base < integer) {
+			toml_parser_integer_overflow_error(parser);
+			return LONG_MIN;
+		}
+		integer *= base;
+		
+		int digit = toml_digit_to_number(c);
+		if (LONG_MAX - digit < integer) {
+			toml_parser_integer_overflow_error(parser);
+			return LONG_MIN;
+		}
+		integer += digit;
+
+		c = toml_parser_get_char(parser);
+
+		if (!allow_zero_prefix && integer == 0) {
+			if (toml_is_ndigit(base, c)) {
+				// throw a more usefull error than just
+				// "unexpected"
+				toml_parser_error(parser, TOML_ERROR_SYNTAX, "cannot have a '%c' digit after a 0 for base %d", c, base);
+				return LONG_MIN;
+			}
+			break;
+		}
+
+		if (c == '_') {
+			// optional underscore
+			// NOTE : we must have a valid digit after it
+			c = toml_parser_get_char(parser);
+			if (c == TOML_ERROR) return LONG_MIN;
+			if (!toml_is_hex_digit(c)) {
+				toml_parser_underscore_error(parser);
+				return LONG_MIN;
+			}
+		} else if (!toml_is_ndigit(base, c)) {
+			break;
+		}
+	}
+
+	toml_parser_unget_char(parser, c);
+	return integer;
+}
+
+#define TOML_EXP_MIN (-256)
+#define TOML_EXP_MAX 256
+
 static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 	(void)parser;
 	
@@ -946,64 +1026,40 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 		}
 	}
 
-	long integer = 0;
-	for (;;) {
-		if (!toml_is_ndigit(base, c)) {
-			// try to throw more usefull errors than just
-			// "unexpected"
-digit_error:
-			if (toml_is_hex_digit(c)) {
-				toml_parser_error(parser, TOML_ERROR_SYNTAX, "invalid digit '%c' for base %d", c, base);
-			} else if (c == '_') {
-underscore_error:
-				toml_parser_error(parser, TOML_ERROR_SYNTAX, "a '_' must be surrounded by digits");
-			} else if (c != TOML_ERROR) {
-				toml_parser_unexpected(parser, c);
-			}
-			return NULL;
-		}
-
-		integer *= base;
-		integer += toml_digit_to_number(c);
-
-		c = toml_parser_get_char(parser);
-
-		// NOTE: the spec does not accept prefixed 0 for base 10
-		if (base == 10 && integer == 0) {
-			if (toml_is_ndigit(base, c)) {
-				// throw a more usefull error than just
-				// "unexpected"
-				toml_parser_error(parser, TOML_ERROR_SYNTAX, "cannot have a '%c' digit after a 0 for base 10", c);
-				return NULL;
-			}
-			break;
-		}
-
-		if (c == '_') {
-			// optional underscore
-			// NOTE : we must have a valid digit after it
-			c = toml_parser_get_char(parser);
-			if (c == TOML_ERROR) return NULL;
-			if (!toml_is_hex_digit(c)) goto underscore_error;
-		} else if (!toml_is_ndigit(base, c)) {
-			break;
-		}
-	}
-
+	// NOTE: the spec does not accept prefixed 0 for base 10
+	long integer = toml_parser_unsigned_integer(parser, base, base != 10, c);
+	if (integer == LONG_MIN) return NULL;
+	c = toml_parser_get_char(parser);
 
 	if (base == 10) {
 		int have_float = TOML_FALSE;
+		long pow = 0;
 
-		long frac = 1;
 		if (c == '.') {
 			have_float = TOML_TRUE;
 			c = toml_parser_get_char(parser);
 			for (;;) {
-				if (!toml_is_digit(c)) goto digit_error;
+				if (!toml_is_digit(c)) {
+					toml_parser_digit_error(parser, 10, c);
+					return NULL;
+				}
 
-				integer *= 10;
-				frac *= 10;
-				integer += toml_digit_to_number(c);
+				// once we reach TOML_EXP_MIN, the number becomes so small
+				// it's not an issue to cap it to TOML_EXP_IN
+				if (pow > TOML_EXP_MIN) {
+					pow--;
+					if (LONG_MAX / 10 < integer) {
+						toml_parser_integer_overflow_error(parser);
+						return NULL;
+					}
+					integer *= 10;
+					int number = toml_digit_to_number(c);
+					if (LONG_MAX - number < integer) {
+						toml_parser_integer_overflow_error(parser);
+						return NULL;
+					}
+					integer += number;
+				}
 
 				c = toml_parser_get_char(parser);
 
@@ -1012,45 +1068,46 @@ underscore_error:
 					// NOTE : we must have a valid digit after it
 					c = toml_parser_get_char(parser);
 					if (c == TOML_ERROR) return NULL;
-					if (!toml_is_hex_digit(c)) goto underscore_error;
+					if (!toml_is_hex_digit(c)) {
+						toml_parser_underscore_error(parser);
+						return NULL;
+					}
 				} else if (!toml_is_digit(c)) {
 					break;
 				}
 			}
 		}
 	
-
-		long pow = 0;
 		if (c == 'e') {
 			have_float = TOML_TRUE;
-			int pow_sign = '+';
+			int exp_sign = '+';
 			c = toml_parser_get_char(parser);
 			if (c == '-' || c == '+') {
-				pow_sign = c;
+				exp_sign = c;
 				c = toml_parser_get_char(parser);
 			}
 
-			long pow_value = 0;
-			for (;;) {
-				if (!toml_is_digit(c)) goto digit_error;
+			long exp = toml_parser_unsigned_integer(parser, 10, TOML_TRUE, c);
+			if (exp == LONG_MIN) return NULL;
+			c = toml_parser_get_char(parser);
 
-				pow_value *= 10;
-				pow_value += toml_digit_to_number(c);
-
-				c = toml_parser_get_char(parser);
-
-				if (c == '_') {
-					// optional underscore
-					// NOTE : we must have a valid digit after it
-					c = toml_parser_get_char(parser);
-					if (c == TOML_ERROR) return NULL;
-					if (!toml_is_hex_digit(c)) goto underscore_error;
-				} else if (!toml_is_digit(c)) {
-					break;
+			if (exp_sign == '+') {
+				if (TOML_EXP_MAX - pow < exp) {
+					// once we reach TOML_EXP_MAX, the number becomes so big
+					// it's not an issue to cap it to TOML_EXP_MAX
+					pow = TOML_EXP_MAX;
+				} else {
+					pow += exp;
+				}
+			} else {
+				if (pow - TOML_EXP_MIN < exp) {
+					// once we reach TOML_EXP_MIN, the number becomes so small
+					// it's not an issue to cap it to TOML_EXP_MIN
+					pow = TOML_EXP_MIN;
+				} else {
+					pow -= exp;
 				}
 			}
-
-			pow = pow_sign == '-' ? -pow_value : pow_value;
 		}
 
 		if (have_float) {
@@ -1059,7 +1116,7 @@ underscore_error:
 			toml_parser_no_float(parser);
 			return NULL;
 #else
-			float f = (float)(sign == '-' ? -integer : integer) / frac;
+			float f = (sign == '-' ? -integer : integer);
 			if (pow > 0) {
 				for (long i = 0; i < pow; i++) {
 					f *= 10;

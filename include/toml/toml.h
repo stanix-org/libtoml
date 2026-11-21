@@ -90,6 +90,7 @@ typedef struct toml_error {
 #define TOML_ERROR_SYNTAX  2
 #define TOML_ERROR_UNICODE 3
 #define TOML_ERROR_FEATURE 4
+#define TOML_ERROR_LIMIT   5
 
 toml_value_t *toml_value_new(toml_type_t type);
 void toml_value_free(toml_value_t *value);
