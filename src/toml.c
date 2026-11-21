@@ -9,6 +9,7 @@ struct toml_parser {
 	int unget;
 	int colno;
 	int lineno;
+	int depth;
 	const char *filename;
 	void *private;
 	int (*get_byte)(void *private);
@@ -16,6 +17,10 @@ struct toml_parser {
 
 static toml_value_t *toml_parser_value(toml_parser_t *parser);
 static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table);
+
+#define TOML_EXP_MIN (-256)
+#define TOML_EXP_MAX 256
+#define TOML_DEPTH_MAX 100
 
 #ifdef __STDC_HOSTED__
 #include <stdlib.h>
@@ -364,7 +369,8 @@ static void toml_parser_init(toml_parser_t *parser, int (*get_byte)(void *privat
 	parser->error    = error;
 	parser->unget    = TOML_NOTHING;
 	parser->colno    = 0;
-	parser->lineno   = 0;
+	parser->lineno   = 1;
+	parser->depth    = 0;
 	parser->filename = filename ? filename : "";
 	parser->private  = private;
 	parser->get_byte = get_byte;
@@ -541,6 +547,21 @@ static int toml_parser_expect(toml_parser_t *parser, int expected) {
 	}
 }
 
+static int toml_parser_depth_inc(toml_parser_t *parser) {
+	parser->depth++;
+	if (parser->depth > TOML_DEPTH_MAX) {
+		toml_parser_error(parser, TOML_ERROR_LIMIT, "inline table or array too deep (limit is %d)", TOML_DEPTH_MAX);
+		return -1;
+	} else {
+		return 0;
+	}
+}
+
+static void toml_parser_depth_dec(toml_parser_t *parser) {
+	TOML_ASSERT(parser->depth > 0);
+	parser->depth--;
+}
+
 static int toml_is_alpha(int c) {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
@@ -690,9 +711,12 @@ static int toml_parser_skip_spaces_comments_newlines(toml_parser_t *parser) {
 static toml_table_t *toml_parser_inline_table(toml_parser_t *parser) {
 	if (toml_parser_expect(parser, '{') < 0) return NULL;
 
+	if (toml_parser_depth_inc(parser) < 0) return NULL;
+
 	toml_table_t *table = toml_table_new();
 	if (!table) {
 		toml_parser_no_memory(parser);
+		toml_parser_depth_dec(parser);
 		return NULL;
 	}
 
@@ -714,19 +738,24 @@ static toml_table_t *toml_parser_inline_table(toml_parser_t *parser) {
 
 	if (toml_parser_expect(parser, '}') < 0) goto error;
 
+	toml_parser_depth_dec(parser);
 	return table;
 
 error:
 	toml_table_free(table);
+	toml_parser_depth_dec(parser);
 	return NULL;
 }
 
 static toml_array_t *toml_parser_array(toml_parser_t *parser) {
 	if (toml_parser_expect(parser, '[') < 0) return NULL;
 
+	if (toml_parser_depth_inc(parser) < 0) return NULL;
+
 	toml_array_t *array = toml_array_new();
 	if (!array) {
 		toml_parser_no_memory(parser);
+		toml_parser_depth_dec(parser);
 		return NULL;
 	}
 
@@ -755,10 +784,12 @@ static toml_array_t *toml_parser_array(toml_parser_t *parser) {
 
 	if (toml_parser_expect(parser, ']') < 0) goto error;
 
+	toml_parser_depth_dec(parser);
 	return array;
 
 error:
 	toml_array_free(array);
+	toml_parser_depth_dec(parser);
 	return NULL;
 }
 
@@ -966,9 +997,6 @@ static long toml_parser_unsigned_integer(toml_parser_t *parser, int base, int al
 	toml_parser_unget_char(parser, c);
 	return integer;
 }
-
-#define TOML_EXP_MIN (-256)
-#define TOML_EXP_MAX 256
 
 static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 	(void)parser;
