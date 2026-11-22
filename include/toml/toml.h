@@ -125,8 +125,7 @@ toml_bool_t *toml_bool_new(int value);
 #define TOML_VALUE(x) ((toml_value_t*)(x))
 
 #define TOML_EOF     -1
-#define TOML_NOTHING -2
-#define TOML_ERROR   -3
+#define TOML_ERROR   -2
 
 void toml_error_free(toml_error_t *error);
 void toml_error_to_str(toml_error_t *error, char *buf, size_t size);

@@ -6,7 +6,8 @@ typedef struct toml_parser toml_parser_t;
 
 struct toml_parser {
 	toml_error_t *error;
-	int unget;
+	int unget[3];
+	int unget_length;
 	int colno;
 	int lineno;
 	int depth;
@@ -95,7 +96,7 @@ static size_t toml_strlen_helper(const char *str) {
 #ifndef TOML_STRDUP
 static char *toml_strdup_helper(const char *str) {
 	size_t len = TOML_STRLEN(str);
-	char *new_str = TOML_MALLOC(str);
+	char *new_str = TOML_MALLOC(len + i);
 	if (!new_str) return NULL;
 	return TOML_MEMCPY(new_str, str, len + 1);
 }
@@ -386,14 +387,14 @@ void toml_error_to_str(toml_error_t *error, char *buf, size_t size) {
 }
 
 static void toml_parser_init(toml_parser_t *parser, int (*get_byte)(void *private), void *private, const char *filename, toml_error_t *error) {
-	parser->error    = error;
-	parser->unget    = TOML_NOTHING;
-	parser->colno    = 0;
-	parser->lineno   = 1;
-	parser->depth    = 0;
-	parser->filename = filename ? filename : "";
-	parser->private  = private;
-	parser->get_byte = get_byte;
+	parser->error        = error;
+	parser->unget_length = 0;
+	parser->colno        = 0;
+	parser->lineno       = 1;
+	parser->depth        = 0;
+	parser->filename     = filename ? filename : "";
+	parser->private      = private;
+	parser->get_byte     = get_byte;
 }
 
 static void toml_parser_set_error(toml_parser_t *parser, int type, int allocated, const char *message) {
@@ -433,10 +434,8 @@ static void toml_parser_error(toml_parser_t *parser, int type, const char *fmt, 
 }
 
 static int toml_parser_get_char(toml_parser_t *parser) {
-	if (parser->unget != TOML_NOTHING) {
-		int c = parser->unget;
-		parser->unget = TOML_NOTHING;
-		return c;
+	if (parser->unget_length > 0) {
+		return parser->unget[--parser->unget_length];
 	}
 
 	unsigned char data[4] = {0};
@@ -513,14 +512,30 @@ invalid:
 }
 
 static void toml_parser_unget_char(toml_parser_t *parser, int unget) {
-	TOML_ASSERT(parser->unget == TOML_NOTHING);
-	parser->unget = unget;
+	TOML_ASSERT((size_t)parser->unget_length < sizeof(parser->unget) / sizeof(*parser->unget));
+	parser->unget[parser->unget_length++] = unget;
 }
 
 static int toml_parser_peek_char(toml_parser_t *parser) {
 	int c = toml_parser_get_char(parser);
 	toml_parser_unget_char(parser, c);
 	return c;
+}
+
+static int toml_parser_peek_chars(toml_parser_t *parser, int *chars, int len) {
+	int got = 0;
+	for (int i = 0; i < len; i++) {
+		int c = toml_parser_get_char(parser);
+		if (c == TOML_ERROR) return -1;
+		if (c == TOML_EOF) break;
+		chars[i] = c;
+		got++;
+	}
+
+	for (int i = got; i > 0; i--) {
+		toml_parser_unget_char(parser, chars[i - 1]);
+	}
+	return got;
 }
 
 static const char *toml_char_name(char *buf, size_t size, int c) {
@@ -634,6 +649,10 @@ static int toml_is_space(int c) {
 
 static int toml_is_comment(int c) {
 	return c == '#';
+}
+
+static int toml_is_newline(int c) {
+	return c == '\r' || c == '\n';
 }
 
 static int toml_is_unquoted_key_char(int c) {
@@ -870,6 +889,24 @@ static int toml_parser_escaped(toml_parser_t *parser) {
 	}
 }
 
+static int toml_parser_escaped_newline(toml_parser_t *parser) {
+	if (toml_parser_expect(parser, '\\') < 0) return -1;
+	toml_parser_skip_spaces(parser);
+	if (toml_parser_newline(parser) < 0) return -1;
+
+	for (;;) {
+		int c = toml_parser_peek_char(parser);
+		if (toml_is_space(c)) {
+			toml_parser_skip_spaces(parser);
+		} else if (toml_is_newline(c)) {
+			if (toml_parser_newline(parser) < 0) return -1;
+		} else {
+			break;
+		}
+	}
+	return 0;
+}
+
 static int toml_parser_basic_char(toml_parser_t *parser) {
 	int c = toml_parser_get_char(parser);
 	if (toml_is_basic_unescaped(c)) {
@@ -883,7 +920,7 @@ static int toml_parser_basic_char(toml_parser_t *parser) {
 
 static toml_string_t *toml_parser_basic_string(toml_parser_t *parser) {
 	if (toml_parser_expect(parser, '"') < 0) return NULL;
-		
+	
 	toml_string_t *string = toml_string_new(NULL);
 	if (!string) {
 		toml_parser_no_memory(parser);
@@ -893,14 +930,76 @@ static toml_string_t *toml_parser_basic_string(toml_parser_t *parser) {
 	while (toml_is_basic_char(toml_parser_peek_char(parser))) {
 		int c = toml_parser_basic_char(parser);
 		if (c == TOML_ERROR) goto error;
-		toml_string_append_codepoint(string, c);
+		if (toml_string_append_codepoint(string, c) < 0) goto error;
 	}
 
 	if (toml_parser_expect(parser, '"') < 0) {
 error:
-		toml_value_free(TOML_VALUE(string));
+		toml_string_free(string);
 		return NULL;
 	}
+
+	return string;
+}
+
+static int toml_is_ml_basic_string_delim(int chars[3]) {
+	if (chars[0] != '"') return 0;
+	if (chars[1] != '"') return 0;
+	if (chars[2] != '"') return 0;
+	return 1;
+}
+
+static toml_string_t *toml_parser_ml_basic_string(toml_parser_t *parser) {
+	if (toml_parser_expect(parser, '"') < 0) return NULL;
+	if (toml_parser_expect(parser, '"') < 0) return NULL;
+	if (toml_parser_expect(parser, '"') < 0) return NULL;
+
+	// optional newline
+	if (toml_is_newline(toml_parser_peek_char(parser))) {
+		if (toml_parser_newline(parser) < 0) return NULL;
+	}
+
+	toml_string_t *string = toml_string_new(NULL);
+	if (!string) {
+		toml_parser_no_memory(parser);
+		return NULL;
+	}
+
+	for (;;) {
+		int chars[3];
+		int len = toml_parser_peek_chars(parser, chars, 3);
+		if (len < 0) goto error;
+
+		if (len >= 1 && toml_is_newline(chars[0])) {
+			if (toml_parser_newline(parser) < 0) goto error;
+			toml_string_append_char(string, '\n');
+		} else if (len >= 2 && chars[0] == '\\' && (toml_is_space(chars[1]) || toml_is_newline(chars[1]))) {
+			// escaped newline
+			if (toml_parser_escaped_newline(parser) < 0) goto error;
+		} else if (len >= 1 && toml_is_basic_char(chars[0])) {
+			int c = toml_parser_basic_char(parser);
+			if (c == TOML_ERROR) goto error;
+			if (toml_string_append_codepoint(string, c) < 0) {
+				goto error;
+			}
+		} else if (len >= 3 && toml_is_ml_basic_string_delim(chars)) {
+			// we got a """
+			break;
+		} else if (len >= 1 && chars[0] == '"') {
+			int c = toml_parser_get_char(parser);
+			if (toml_string_append_char(string, c) < 0) goto error;
+		} else {
+			break;
+		}
+	}
+
+	if (toml_parser_expect(parser, '"') < 0) {
+error:
+		toml_string_free(string);
+		return NULL;
+	}
+	if (toml_parser_expect(parser, '"') < 0) goto error;
+	if (toml_parser_expect(parser, '"') < 0) goto error;
 
 	return string;
 }
@@ -916,30 +1015,94 @@ static toml_string_t *toml_parser_litteral_string(toml_parser_t *parser) {
 
 	int	c = toml_parser_get_char(parser);
 	while (toml_is_litteral_char(c)) {
-		toml_string_append_codepoint(string, c);
+		if (toml_string_append_codepoint(string, c) < 0) goto error;
 		c = toml_parser_get_char(parser);
 	}
 	toml_parser_unget_char(parser, c);
 
 	if (toml_parser_expect(parser, '\'') < 0) {
-		toml_value_free(TOML_VALUE(string));
+error:
+		toml_string_free(string);
 		return NULL;
 	}
 
 	return string;
 }
 
-static toml_string_t *toml_parser_string(toml_parser_t *parser) {
-	int c = toml_parser_peek_char(parser);
-	// TODO : multi lines support
-	switch (c) {
-	case '"':
-		return toml_parser_basic_string(parser);
-	case '\'':
-		return toml_parser_litteral_string(parser);
-	case TOML_ERROR:
+static int toml_is_ml_litteral_string_delim(int chars[3]) {
+	if (chars[0] != '\'') return 0;
+	if (chars[1] != '\'') return 0;
+	if (chars[2] != '\'') return 0;
+	return 1;
+}
+
+static toml_string_t *toml_parser_ml_litteral_string(toml_parser_t *parser) {
+	if (toml_parser_expect(parser, '\'') < 0) return NULL;
+	if (toml_parser_expect(parser, '\'') < 0) return NULL;
+	if (toml_parser_expect(parser, '\'') < 0) return NULL;
+
+	// optional newline
+	if (toml_is_newline(toml_parser_peek_char(parser))) {
+		if (toml_parser_newline(parser) < 0) return NULL;
+	}
+
+	toml_string_t *string = toml_string_new(NULL);
+	if (!string) {
+		toml_parser_no_memory(parser);
 		return NULL;
-	default:
+	}
+
+	for (;;) {
+		int chars[3];
+		int len = toml_parser_peek_chars(parser, chars, 3);
+		if (len < 0) goto error;
+
+		if (len >= 1 && toml_is_newline(chars[0])) {
+			if (toml_parser_newline(parser) < 0) goto error;
+			toml_string_append_char(string, '\n');
+		} else if (len >= 1 && toml_is_litteral_char(chars[0])) {
+			int c = toml_parser_get_char(parser);
+			if (c == TOML_ERROR) goto error;
+			if (toml_string_append_codepoint(string, c) < 0) {
+				goto error;
+			}
+		} else if (len >= 3 && toml_is_ml_litteral_string_delim(chars)) {
+			// we got a '''
+			break;
+		} else if (len >= 1 && chars[0] == '\'') {
+			int c = toml_parser_get_char(parser);
+			if (toml_string_append_char(string, c) < 0) goto error;
+		} else {
+			break;
+		}
+	}
+
+	if (toml_parser_expect(parser, '\'') < 0) {
+error:
+		toml_string_free(string);
+		return NULL;
+	}
+	if (toml_parser_expect(parser, '\'') < 0) goto error;
+	if (toml_parser_expect(parser, '\'') < 0) goto error;
+
+	return string;
+}
+
+static toml_string_t *toml_parser_string(toml_parser_t *parser) {
+	int chars[3];
+	int len = toml_parser_peek_chars(parser, chars, 3);
+	if (len < 0) return NULL;
+	
+	if (len >= 3 && toml_is_ml_basic_string_delim(chars)) {
+		return toml_parser_ml_basic_string(parser);
+	} else if (len >= 3 && toml_is_ml_litteral_string_delim(chars)) {
+		return toml_parser_ml_litteral_string(parser);
+	} else if (len >= 1 && chars[0] == '"') {
+		return toml_parser_basic_string(parser);
+	} else if (len >= 1 && chars[0] == '\'') {
+		return toml_parser_litteral_string(parser);
+	} else {
+		int c = toml_parser_get_char(parser);
 		toml_parser_unexpected(parser, c);
 		return NULL;
 	}
@@ -1037,7 +1200,9 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 		toml_parser_no_float(parser);
 		return NULL;
 #else
-		return TOML_VALUE(toml_float_new(sign == '-' ? -INFINITY : INFINITY));
+		toml_float_t *float_ = toml_float_new(sign == '-' ? -INFINITY : INFINITY);
+		if (!float_) toml_parser_no_memory(parser);
+		return TOML_VALUE(float_);
 #endif
 	case 'n':
 		// nan
@@ -1047,7 +1212,9 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 		toml_parser_no_float(parser);
 		return NULL;
 #else
-		return TOML_VALUE(toml_float_new(sign == '-' ? -NAN : NAN));
+		float_ = toml_float_new(sign == '-' ? -NAN : NAN);
+		if (!float_) toml_parser_no_memory(parser);
+		return TOML_VALUE(float_);
 #endif
 	}
 
@@ -1174,7 +1341,9 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 					f /= 10;
 				}
 			}
-			return TOML_VALUE(toml_float_new(f));
+			toml_float_t *float_ = toml_float_new(f);
+			if (!float_) toml_parser_no_memory(parser);
+			return TOML_VALUE(float_);
 #endif
 		}
 	}
@@ -1182,29 +1351,37 @@ static toml_value_t *toml_parser_integer_float_or_date(toml_parser_t *parser) {
 	// TODO : check for dates
 
 	toml_parser_unget_char(parser, c);
-	return TOML_VALUE(toml_integer_new(sign == '-' ? -integer : integer));
+	toml_integer_t *int_ = toml_integer_new(sign == '-' ? -integer : integer);
+	if (!int_) toml_parser_no_memory(parser);
+	return TOML_VALUE(int_);
 }
 
 static toml_bool_t *toml_parser_bool(toml_parser_t *parser) {
 	int c = toml_parser_get_char(parser);
+
+	toml_bool_t *bool_;
 	switch (c) {
 	case 't':
 		if (toml_parser_expect(parser, 'r') < 0) return NULL;
 		if (toml_parser_expect(parser, 'u') < 0) return NULL;
 		if (toml_parser_expect(parser, 'e') < 0) return NULL;
-		return toml_bool_new(TOML_TRUE);
+		bool_ = toml_bool_new(TOML_TRUE);
+		break;
 	case 'f':
 		if (toml_parser_expect(parser, 'a') < 0) return NULL;
 		if (toml_parser_expect(parser, 'l') < 0) return NULL;
 		if (toml_parser_expect(parser, 's') < 0) return NULL;
 		if (toml_parser_expect(parser, 'e') < 0) return NULL;
-		return toml_bool_new(TOML_FALSE);
+		bool_ = toml_bool_new(TOML_FALSE);
+		break;
 	case TOML_ERROR:
 		return NULL;
 	default:
 		toml_parser_unexpected(parser, c);
 		return NULL;
 	}
+	if (!bool_) toml_parser_no_memory(parser);
+	return bool_;
 }
 
 static toml_value_t *toml_parser_value(toml_parser_t *parser) {
