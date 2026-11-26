@@ -106,8 +106,6 @@ void toml_array_free(toml_array_t *array);
 int toml_array_append(toml_array_t *array, toml_value_t *value);
 toml_value_t *toml_array_get(toml_array_t *array, size_t index);
 size_t toml_array_get_count(toml_array_t *array);
-//#define toml_array_foreach (element, index, array) \
-//	for (size_t index = 0; index < (array)->count; i++)
 
 toml_string_t *toml_string_new(const char *string);
 void toml_string_free(toml_string_t *string);

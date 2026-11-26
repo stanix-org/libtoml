@@ -28,7 +28,7 @@ static int toml_parser_key_value(toml_parser_t *parser, toml_table_t *table);
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include <float.h>
+#include <math.h>
 #include <errno.h>
 #define TOML_MALLOC(size)       malloc(size)
 #define TOML_FREE(ptr)          free(ptr)
