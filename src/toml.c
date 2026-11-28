@@ -1707,8 +1707,15 @@ toml_table_t *toml_parse_file(const char *filename, toml_error_t *error) {
 	FILE *file = fopen(filename, "r");
 	if (!file) {
 		if (error) {
-			error->string = strerror(errno);
-			error->allocated = 1;
+			char buf[1024];
+			toml_snprintf(buf, sizeof(buf), "%s : %s", filename, strerror(errno));
+			error->allocated = TOML_FALSE;
+			error->type      = TOML_ERROR_IO;
+			error->string    = TOML_STRDUP(buf);
+			if (!error->string) {
+				error->type = TOML_ERROR_MEMORY;
+				error->string = "no memory available";
+			}
 		}
 		return NULL;
 	}
